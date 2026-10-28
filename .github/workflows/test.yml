@@ -10,7 +10,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
       - run: pip install -r requirements.txt
-      - name: Run tests (all mocked; no network, no API keys needed)
-        run: python tests/test_kalshi.py
+      - run: python tests/test_kalshi.py
