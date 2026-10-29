@@ -66,6 +66,12 @@ class DB:
     def count_event_since(self, event_ticker, ts):
         return self.c.execute("SELECT COUNT(*) FROM estimates WHERE event_ticker=? AND ts>=?", (event_ticker, ts)).fetchone()[0]
 
+    def sibling_estimates(self, event_ticker, ticker, since_ts):
+        """Most recent estimate for each OTHER market of the same event since since_ts."""
+        return self.c.execute(
+            "SELECT e.* FROM estimates e JOIN (SELECT ticker, MAX(ts) mts FROM estimates WHERE event_ticker=? AND ticker!=? AND ts>=? "
+            "GROUP BY ticker) x ON e.ticker=x.ticker AND e.ts=x.mts", (event_ticker, ticker, since_ts)).fetchall()
+
     def last_alert(self, ticker):
         return self.c.execute("SELECT * FROM estimates WHERE ticker=? AND alerted=1 ORDER BY ts DESC LIMIT 1", (ticker,)).fetchone()
 
