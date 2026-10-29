@@ -1,17 +1,16 @@
-ig · PY
 import os
- 
- 
+
+
 def _f(n, d): return float(os.getenv(n, d))
 def _i(n, d): return int(os.getenv(n, d))
 def _b(n, d): return os.getenv(n, str(d)).strip().lower() in ("1", "true", "yes")
- 
- 
+
+
 def _mode(n, d, allowed):
     v = os.getenv(n, d).strip().lower()
     return v if v in allowed else d
- 
- 
+
+
 # ---- secrets / infrastructure ----
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -21,7 +20,7 @@ KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://external-api.kalshi.com/
 BOT_TZ = os.getenv("BOT_TZ", "America/Chicago")
 DIGEST_HOUR = _i("DIGEST_HOUR", 8)                 # local hour for the daily summary message
 POLL_MINUTES = _i("POLL_MINUTES", 30)
- 
+
 # ---- the model that makes the probability estimates ----
 PROVIDER = _mode("PROVIDER", "anthropic", ("anthropic", "openai"))   # which API makes the probability estimates
 ANTHROPIC_MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
@@ -37,7 +36,7 @@ USE_WEB_SEARCH = _b("USE_WEB_SEARCH", True)         # needs web search enabled f
 WEB_SEARCH_TOOL = os.getenv("WEB_SEARCH_TOOL", "web_search_20250305")
 MAX_SEARCHES = _i("MAX_SEARCHES", 4)
 MAX_TOKENS = _i("MAX_TOKENS", 2000)
- 
+
 # ---- which markets are worth researching ----
 SERIES = os.getenv("SERIES", "").strip()            # optional: comma-separated series tickers to focus on (e.g. KXCPI,KXFED)
 CLOSE_MIN_HOURS = _f("CLOSE_MIN_HOURS", 6)          # skip markets closing sooner than this
@@ -53,7 +52,7 @@ REESTIMATE_HOURS = _f("REESTIMATE_HOURS", 24)
 REESTIMATE_MOVE = _f("REESTIMATE_MOVE", 0.10)       # ...unless the price moved this much
 MAX_ESTIMATES_PER_CYCLE = _i("MAX_ESTIMATES_PER_CYCLE", 4)
 DAILY_ESTIMATE_BUDGET = _i("DAILY_ESTIMATE_BUDGET", 20)   # hard cap on model calls per day (cost control)
- 
+
 # ---- when to alert ----
 MODEL_WEIGHT = _f("MODEL_WEIGHT", 0.5)              # blended p = w*model + (1-w)*market mid. 1.0 = trust the model fully
 MIN_EDGE = _f("MIN_EDGE", 0.05)                     # expected profit per $1 contract AFTER fees, on the blended p
@@ -62,7 +61,7 @@ MIN_CONFIDENCE = _mode("MIN_CONFIDENCE", "medium", ("low", "medium", "high"))
 MAX_ALERTS_PER_DAY = _i("MAX_ALERTS_PER_DAY", 5)    # 0 = unlimited
 COOLDOWN_HOURS = _f("COOLDOWN_HOURS", 72)           # no repeat alert on the same market and side within this window
 TELEGRAM_CONTROL = _b("TELEGRAM_CONTROL", True)
- 
+
 # ======================= TRADING (everything below is OFF by default) =======================
 # off   = alerts only (default)         paper = simulated fills in the database, no Kalshi account needed
 # demo  = real order code against Kalshi's fake-money demo environment (set KALSHI_BASE_URL to the demo API too)
@@ -74,12 +73,12 @@ TRADE_APPROVAL = _mode("TRADE_APPROVAL", "manual", ("manual", "auto"))   # manua
 AUTO_MIN_CONFIDENCE = _mode("AUTO_MIN_CONFIDENCE", "high", ("low", "medium", "high"))   # auto mode only trades this confident...
 AUTO_MIN_EDGE = _f("AUTO_MIN_EDGE", 0.08)                                              # ...and this large an edge (else asks you)
 TRADE_BUTTON_TTL_MIN = _f("TRADE_BUTTON_TTL_MIN", 30)      # a Buy button stops working after this many minutes
- 
+
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "").strip()
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")            # PEM text ("\n" escapes allowed)
 KALSHI_PRIVATE_KEY_B64 = os.getenv("KALSHI_PRIVATE_KEY_B64", "")    # or the PEM base64-encoded (easiest on Railway)
 KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
- 
+
 # Risk limits (dollars). Positions are held to settlement: the most you can lose on an order is what you paid.
 MAX_ORDER_USD = _f("MAX_ORDER_USD", 10)
 MAX_DAILY_USD = _f("MAX_DAILY_USD", 25)             # total spend per local day
