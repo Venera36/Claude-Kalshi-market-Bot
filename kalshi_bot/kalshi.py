@@ -62,6 +62,13 @@ def parse_market(raw):
     }
 
 
+def excluded(m, prefixes=None):
+    """True if the market's ticker or event ticker starts with any EXCLUDE_SERIES prefix (case-insensitive)."""
+    raw = C.EXCLUDE_SERIES if prefixes is None else prefixes
+    pre = tuple(x.strip().upper() for x in raw.split(",") if x.strip())
+    return bool(pre) and (m["ticker"].upper().startswith(pre) or m["event_ticker"].upper().startswith(pre))
+
+
 def structural_ok(m, lo_ts, hi_ts):
     """Cheap filters applied before any model call."""
     if m["market_type"] != "binary" or m["status"] != "active" or m["is_mve"] or not m["two_sided"]:
@@ -138,7 +145,10 @@ class Kalshi:
                                drop=("mve_filter",))
         parsed = [parse_market(r) for r in raws]
         out = [m for m in parsed if structural_ok(m, lo, hi)]
-        log.info("scanned %d markets, %d pass the structural filters", len(parsed), len(out))
+        n_ok = len(out)
+        out = [m for m in out if not excluded(m)]
+        log.info("scanned %d markets, %d pass the structural filters%s", len(parsed), len(out),
+                 f" ({n_ok - len(out)} more excluded by EXCLUDE_SERIES)" if n_ok != len(out) else "")
         return out
 
     def markets_by_tickers(self, tickers):
