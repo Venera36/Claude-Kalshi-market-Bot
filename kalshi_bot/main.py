@@ -75,6 +75,15 @@ def wants_auto(est, edge):
             and edge >= C.AUTO_MIN_EDGE)
 
 
+def trades_only():
+    return C.NOTIFY_LEVEL == "trades"
+
+
+def order_notable(out):
+    """In trades-only mode: message only when something was bought, or something needs your attention."""
+    return "plan" in out and out["result"]["status"] in ("filled", "partial", "rejected", "unknown")
+
+
 def handle_market(db, kal, broker, m, dry):
     question = kal.question(m)
     est = estimator.estimate(question, m)                 # blind: the model never sees the price
@@ -104,11 +113,18 @@ def handle_market(db, kal, broker, m, dry):
         return
     auto = broker is not None and not dry and wants_auto(est, edge)
     a = dict(row, uncertainties=est["uncertainties"])
-    _push(telegram.format_alert(a, fresh, question) + ("\n🤖 <b>Auto-trade is on: attempting this order now.</b>" if auto else ""),
-          dry, None if auto else alert_buttons(eid))
+    if trades_only() and not auto and C.TRADING_MODE != "off" and C.TRADE_APPROVAL == "auto":
+        log.info("%s: alert not sent (NOTIFY_LEVEL=trades, below the auto-trade thresholds)", m["ticker"])
+        return
+    if not (trades_only() and auto):                      # in trades-only mode the order result is the only message
+        _push(telegram.format_alert(a, fresh, question) + ("\n🤖 <b>Auto-trade is on: attempting this order now.</b>" if auto else ""),
+              dry, None if auto else alert_buttons(eid))
     if auto:
         out = trader.execute(db, kal, broker, eid, "auto")
-        _push(telegram.format_order_result(out) if "plan" in out else "🚫 <b>Auto order not placed:</b> " + html.escape(out["reason"]), dry)
+        if not trades_only() or order_notable(out):
+            _push(telegram.format_order_result(out) if "plan" in out else "🚫 <b>Auto order not placed:</b> " + html.escape(out["reason"]), dry)
+        else:
+            log.info("%s: auto order not executed (%s)", m["ticker"], out.get("reason") or out["result"]["status"])
 
 
 def run_cycle(db, kal, broker, dry):
@@ -166,7 +182,7 @@ def settle(db, kal, dry):
         n += 1
         if settle_order(db, r, outcome, dry):
             continue
-        if r["alerted"]:
+        if r["alerted"] and not trades_only():
             _push(telegram.format_settlement(dict(db.get_estimate(r["id"])), outcome == 1), dry)
     return n
 
@@ -251,7 +267,7 @@ def main():
     live = not a.dry_run and not a.once
     if live and C.TELEGRAM_CONTROL:
         control.start()
-    if live:
+    if live and not trades_only():
         if C.TRADING_MODE == "off":
             trading = "alert-only, no orders"
         else:
@@ -274,7 +290,7 @@ def main():
                 telegram.send(f"⚠️ Claude-Kalshi-Bot: {fails} cycles in a row have failed. Last error: {html.escape(str(e)[:300])}")
         try:
             settle(db, kal, a.dry_run)
-            if live:
+            if live and not trades_only():
                 digest(db, a.dry_run)
         except Exception:
             log.exception("settlement/digest failed")
