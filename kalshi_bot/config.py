@@ -58,6 +58,8 @@ MODEL_WEIGHT = _f("MODEL_WEIGHT", 0.5)              # blended p = w*model + (1-w
 MIN_EDGE = _f("MIN_EDGE", 0.05)                     # expected profit per $1 contract AFTER fees, on the blended p
 FEE_RATE = _f("FEE_RATE", 0.07)                     # Kalshi taker fee = rate * P * (1-P) per contract (check their fee schedule)
 MIN_CONFIDENCE = _mode("MIN_CONFIDENCE", "medium", ("low", "medium", "high"))
+MAX_MODEL_GAP = _f("MAX_MODEL_GAP", 0.25)           # skip (log only) when the model's raw p differs from the market mid by more than this; 0 = off
+PAIR_TOLERANCE = _f("PAIR_TOLERANCE", 0.15)         # two complementary markets of one event: their model p's must sum to 1 within this; 0 = off
 MAX_ALERTS_PER_DAY = _i("MAX_ALERTS_PER_DAY", 5)    # 0 = unlimited
 COOLDOWN_HOURS = _f("COOLDOWN_HOURS", 72)           # no repeat alert on the same market and side within this window
 TELEGRAM_CONTROL = _b("TELEGRAM_CONTROL", True)
