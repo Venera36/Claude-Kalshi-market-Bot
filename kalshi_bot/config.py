@@ -63,6 +63,10 @@ MAX_MODEL_GAP = _f("MAX_MODEL_GAP", 0.25)           # skip (log only) when the m
 PAIR_TOLERANCE = _f("PAIR_TOLERANCE", 0.15)         # two complementary markets of one event: their model p's must sum to 1 within this; 0 = off
 MAX_ALERTS_PER_DAY = _i("MAX_ALERTS_PER_DAY", 5)    # 0 = unlimited
 COOLDOWN_HOURS = _f("COOLDOWN_HOURS", 72)           # no repeat alert on the same market and side within this window
+# all    = startup message, every alert, order messages, settlements, daily summary (default)
+# trades = only order messages (filled / partially filled / rejected / unknown) and their settlements, plus safety warnings.
+#          With TRADE_APPROVAL=manual (or trading off) alerts are still sent, because you need them to act.
+NOTIFY_LEVEL = _mode("NOTIFY_LEVEL", "all", ("all", "trades"))
 TELEGRAM_CONTROL = _b("TELEGRAM_CONTROL", True)
 
 # ======================= TRADING (everything below is OFF by default) =======================
