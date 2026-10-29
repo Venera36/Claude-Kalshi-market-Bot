@@ -50,6 +50,12 @@ def decide(db, est, edge, side, m):
         return "low_confidence"
     if est["resolution_risk"] == "high":
         return "resolution_risk"
+    if C.MAX_MODEL_GAP and abs(est["p"] - m["mid"]) > C.MAX_MODEL_GAP:
+        return "extreme_gap"          # a huge disagreement with a liquid market is far more often model error than edge
+    if C.PAIR_TOLERANCE:
+        for sib in db.sibling_estimates(m["event_ticker"], m["ticker"], time.time() - C.REESTIMATE_HOURS * 3600):
+            if abs(sib["mid"] + m["mid"] - 1) <= 0.12 and abs(sib["p_model"] + est["p"] - 1) > C.PAIR_TOLERANCE:
+                return "inconsistent"  # the two sides of one event should be complementary; the model contradicted itself
     prev = db.last_alert(m["ticker"])
     if prev and time.time() - prev["ts"] < C.COOLDOWN_HOURS * 3600 and prev["side"] == side:
         return "cooldown"
