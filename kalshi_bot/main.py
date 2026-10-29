@@ -223,8 +223,11 @@ def main():
         if not errs and C.TRADING_MODE != "off":
             print(f"OK. Balance: ${trader.make_broker(DB(C.DATA_DIR)).balance():,.2f}")
         return
-    if not C.ANTHROPIC_API_KEY:
-        sys.exit("Set ANTHROPIC_API_KEY (console.anthropic.com).")
+    if C.PROVIDER == "openai":
+        if not C.OPENAI_API_KEY:
+            sys.exit("PROVIDER=openai but OPENAI_API_KEY is not set (platform.openai.com).")
+    elif not C.ANTHROPIC_API_KEY:
+        sys.exit("Set ANTHROPIC_API_KEY (console.anthropic.com), or set PROVIDER=openai with OPENAI_API_KEY.")
     if not a.dry_run and not (C.TELEGRAM_BOT_TOKEN and C.TELEGRAM_CHAT_ID):
         sys.exit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (or use --dry-run).")
     errs = trader.validate_config()
@@ -249,7 +252,7 @@ def main():
             trading = (f"<b>TRADING {C.TRADING_MODE.upper()}</b>" + (" — REAL MONEY" if C.TRADING_MODE == "live" else "") +
                        f" · approval {C.TRADE_APPROVAL} · balance ${bal} · per order ≤${C.MAX_ORDER_USD:.0f}, per day ≤${C.MAX_DAILY_USD:.0f}, "
                        f"daily loss stop ${C.MAX_DAILY_LOSS_USD:.0f}. /halt stops all orders.")
-        telegram.send(f"🟢 <b>Claude-Kalshi-Bot started</b> — {trading}\nModel {html.escape(C.MODEL)}, "
+        telegram.send(f"🟢 <b>Claude-Kalshi-Bot started</b> — {trading}\nModel {html.escape(C.PROVIDER)}/{html.escape(C.MODEL)}, "
                       f"web search {'on' if C.USE_WEB_SEARCH else 'off'}, ≤{C.DAILY_ESTIMATE_BUDGET} estimates/day.\n"
                       "Commands: /status /report /orders /pnl /balance /pause /resume /halt /unhalt")
     fails = 0
