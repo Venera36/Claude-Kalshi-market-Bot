@@ -39,6 +39,7 @@ MAX_TOKENS = _i("MAX_TOKENS", 2000)
 
 # ---- which markets are worth researching ----
 SERIES = os.getenv("SERIES", "").strip()            # optional: comma-separated series tickers to focus on (e.g. KXCPI,KXFED)
+EXCLUDE_SERIES = os.getenv("EXCLUDE_SERIES", "").strip()    # comma-separated ticker prefixes to never research (e.g. KXATP,KXWTA,KXITF)
 CLOSE_MIN_HOURS = _f("CLOSE_MIN_HOURS", 6)          # skip markets closing sooner than this
 CLOSE_MAX_DAYS = _f("CLOSE_MAX_DAYS", 14)           # skip markets that resolve later than this (so results arrive in time to learn from)
 MAX_PAGES = _i("MAX_PAGES", 6)                      # pages of 1000 markets to scan per cycle
