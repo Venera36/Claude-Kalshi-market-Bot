@@ -1,5 +1,5 @@
-"""Blind probability estimate from Claude: the model is NOT shown the market price, so its view is independent
-instead of anchored on the crowd. Optional Anthropic web search for current facts."""
+"""Blind probability estimate (Anthropic or OpenAI, chosen by PROVIDER): the model is NOT shown the market price, so its
+view is independent instead of anchored on the crowd. Optional web search for current facts."""
 import json
 import time
 import logging
@@ -85,6 +85,10 @@ def _call(body):
 
 
 def estimate(question, m):
+    return _estimate_openai(question, m) if C.PROVIDER == "openai" else _estimate_anthropic(question, m)
+
+
+def _estimate_anthropic(question, m):
     """Returns {'p','confidence','resolution_risk','rationale','uncertainties','in_tok','out_tok','searches'} or None."""
     global _tools_ok
     messages = [{"role": "user", "content": build_user(question, m, dt.datetime.now(dt.timezone.utc).date().isoformat())}]
@@ -118,6 +122,70 @@ def estimate(question, m):
             log.warning("unusable model reply for %s: %.200s", m["ticker"], text)
             return None
         est.update(in_tok=usage["in"], out_tok=usage["out"], searches=usage["searches"])
+        return est
+    except Exception as e:
+        log.warning("estimate failed for %s: %s", m["ticker"], e)
+        return None
+
+
+# ------------------------------------------------------------------ OpenAI (Responses API)
+def _post_openai(body):
+    return requests.post(C.OPENAI_BASE_URL + "/v1/responses",
+                         headers={"Authorization": "Bearer " + C.OPENAI_API_KEY, "content-type": "application/json"},
+                         json=body, timeout=300)
+
+
+def _call_openai(body):
+    for attempt in range(4):
+        r = _post_openai(body)
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(min(10 * (attempt + 1), 60))
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"OpenAI API HTTP {r.status_code}: {r.text[:300]}")
+        return r.json()
+    raise RuntimeError("OpenAI API unavailable after retries")
+
+
+def parse_openai(data):
+    """(text, searches, in_tok, out_tok) from a Responses API reply."""
+    text, searches = "", 0
+    for item in data.get("output", []) or []:
+        if item.get("type") == "web_search_call":
+            if (item.get("action") or {}).get("type", "search") == "search":
+                searches += 1
+        elif item.get("type") == "message":
+            for c in item.get("content", []) or []:
+                if c.get("type") == "output_text":
+                    text += c.get("text", "")
+    u = data.get("usage") or {}
+    return text, searches, u.get("input_tokens", 0), u.get("output_tokens", 0)
+
+
+def _estimate_openai(question, m):
+    global _tools_ok
+    body = {"model": C.OPENAI_MODEL, "instructions": SYSTEM,
+            "input": build_user(question, m, dt.datetime.now(dt.timezone.utc).date().isoformat()),
+            "max_output_tokens": C.OPENAI_MAX_OUTPUT_TOKENS, "reasoning": {"effort": C.OPENAI_REASONING_EFFORT}}
+    if C.USE_WEB_SEARCH and _tools_ok:
+        body["tools"] = [{"type": "web_search", "search_context_size": C.OPENAI_SEARCH_CONTEXT}]
+    try:
+        try:
+            data = _call_openai(body)
+        except RuntimeError as e:
+            if "tools" in body and "HTTP 400" in str(e):
+                log.warning("web search rejected by the API (%s); continuing without it", str(e)[:160])
+                _tools_ok = False
+                body.pop("tools", None)
+                data = _call_openai(body)
+            else:
+                raise
+        text, searches, in_tok, out_tok = parse_openai(data)
+        est = normalize(extract_json(text))
+        if est is None:
+            log.warning("unusable model reply for %s (status %s): %.200s", m["ticker"], data.get("status"), text)
+            return None
+        est.update(in_tok=in_tok, out_tok=out_tok, searches=searches)
         return est
     except Exception as e:
         log.warning("estimate failed for %s: %s", m["ticker"], e)
