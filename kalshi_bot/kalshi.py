@@ -1,569 +1,183 @@
-import os, sys, json, time, base64, tempfile, contextlib
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from kalshi_bot import config as C, kalshi, scoring, estimator, trader, auth, control, telegram, main as M, util
-from kalshi_bot.db import DB
+"""Read-only Kalshi market-data client. GET requests to public endpoints only: no API key, no orders, no account access."""
+import time
+import logging
+import datetime as dt
+import requests
+
+from . import config as C
+
+log = logging.getLogger("kalshi")
 
 
-@contextlib.contextmanager
-def cfg(**kw):
-    old = {k: getattr(C, k) for k in kw}
-    for k, v in kw.items():
-        setattr(C, k, v)
+class KalshiError(Exception):
+    def __init__(self, status, msg):
+        super().__init__(f"HTTP {status}: {msg}")
+        self.status = status
+
+
+def _num(v):
     try:
-        yield
-    finally:
-        for k, v in old.items():
-            setattr(C, k, v)
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
-def raw_market(**kw):
-    d = {"ticker": "KXTEST-26NOV01-T5", "event_ticker": "KXTEST-26NOV01", "market_type": "binary", "status": "active",
-         "yes_sub_title": "Above 5", "no_sub_title": "5 or below", "rules_primary": "rules", "result": "",
-         "close_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400)), "yes_bid_dollars": "0.4000", "yes_ask_dollars": "0.4400",
-         "no_bid_dollars": "0.5600", "no_ask_dollars": "0.6000", "yes_bid_size_fp": "50.00", "yes_ask_size_fp": "40.00",
-         "volume_fp": "5000.00", "volume_24h_fp": "300.00", "open_interest_fp": "900.00"}
-    d.update(kw)
-    return d
+def _price(raw, key):
+    """Dollar price from the *_dollars field; falls back to the legacy integer-cents field."""
+    v = _num(raw.get(key + "_dollars"))
+    if v is None:
+        c = _num(raw.get(key))
+        v = c / 100 if c is not None else None
+    return v
 
 
-def _pem():
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.hazmat.primitives import serialization
-    return ed25519.Ed25519PrivateKey.generate().private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+def _ts(s):
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
 
 
-# ---------------------------------------------------------------- market parsing / filters
-def test_parse_and_filters():
-    m = kalshi.parse_market(raw_market())
-    assert abs(m["mid"] - 0.42) < 1e-9 and abs(m["spread"] - 0.04) < 1e-9 and m["two_sided"]
-    lo, hi = m["close_ts"] - 3600, m["close_ts"] + 3600
-    assert kalshi.structural_ok(m, lo, hi)
-    assert not kalshi.structural_ok(kalshi.parse_market(raw_market(yes_bid_dollars="0.0000")), lo, hi)
-    assert not kalshi.structural_ok(kalshi.parse_market(raw_market(yes_ask_dollars="0.6000")), lo, hi)
-    assert not kalshi.structural_ok(kalshi.parse_market(raw_market(volume_fp="10.00")), lo, hi)
-    assert not kalshi.structural_ok(kalshi.parse_market(raw_market(yes_ask_size_fp="2.00")), lo, hi)
-    assert not kalshi.structural_ok(kalshi.parse_market(raw_market(status="closed")), lo, hi)
-    assert not kalshi.structural_ok(kalshi.parse_market(raw_market(mve_collection_ticker="X")), lo, hi)
-    assert not kalshi.structural_ok(m, lo - 99999, lo - 1)
-    legacy = {k: v for k, v in raw_market().items() if not k.endswith("_dollars")}
-    legacy.update(yes_bid=40, yes_ask=44)
-    assert abs(kalshi.parse_market(legacy)["yes_ask"] - 0.44) < 1e-9
-    assert abs(m["no_ask"] - 0.60) < 1e-9
+def parse_market(raw):
+    yb, ya = _price(raw, "yes_bid"), _price(raw, "yes_ask")
+    nb, na = _price(raw, "no_bid"), _price(raw, "no_ask")
+    two_sided = bool(yb and yb > 0 and ya and 0 < ya < 1 and ya >= yb)
+    if two_sided:                      # YES and NO books mirror each other; derive if a side is missing
+        na = na if na and 0 < na < 1 else 1 - yb
+        nb = nb if nb and nb > 0 else 1 - ya
+    return {
+        "ticker": raw.get("ticker", ""), "event_ticker": raw.get("event_ticker", ""),
+        "market_type": raw.get("market_type", ""), "status": raw.get("status", ""), "result": raw.get("result", "") or "",
+        "yes_sub_title": raw.get("yes_sub_title", "") or "", "no_sub_title": raw.get("no_sub_title", "") or "",
+        "rules_primary": raw.get("rules_primary", "") or "", "rules_secondary": raw.get("rules_secondary", "") or "",
+        "close_time": raw.get("close_time", ""), "close_ts": _ts(raw.get("close_time", "")),
+        "yes_bid": yb, "yes_ask": ya, "no_bid": nb, "no_ask": na, "last": _price(raw, "last_price"),
+        "bid_size": _num(raw.get("yes_bid_size_fp")), "ask_size": _num(raw.get("yes_ask_size_fp")),
+        "volume": _num(raw.get("volume_fp")) or 0.0, "volume24h": _num(raw.get("volume_24h_fp")) or 0.0,
+        "open_interest": _num(raw.get("open_interest_fp")) or 0.0,
+        "two_sided": two_sided,
+        "mid": (yb + ya) / 2 if two_sided else None, "spread": (ya - yb) if two_sided else None,
+        "is_mve": bool(raw.get("mve_collection_ticker")) or str(raw.get("ticker", "")).startswith("KXMVE"),
+        "title": ((raw.get("title") or "") if isinstance(raw.get("title"), str) else ""),
+    }
 
 
-# ---------------------------------------------------------------- scoring
-def test_edge_and_scorecard():
-    m = kalshi.parse_market(raw_market())
-    side, edge, price, fee = scoring.best_edge(0.60, m)
-    assert side == "yes" and abs(price - 0.44) < 1e-9 and abs(edge - (0.60 - 0.44 - 0.07 * 0.44 * 0.56)) < 1e-9
-    side, edge, price, fee = scoring.best_edge(0.20, m)
-    assert side == "no" and abs(price - 0.60) < 1e-9 and edge > 0
-    assert scoring.best_edge(0.42, m)[1] < 0
-    rows = [dict(ts=1, ticker="A", p_model=0.8, p_adj=0.7, mid=0.5, outcome=1, pnl=None, decision="", price=0, fee=0),
-            dict(ts=2, ticker="A", p_model=0.1, p_adj=0.3, mid=0.5, outcome=1, pnl=None, decision="", price=0, fee=0),
-            dict(ts=3, ticker="B", p_model=0.2, p_adj=0.3, mid=0.5, outcome=0, pnl=None, decision="", price=0, fee=0)]
-    sc = scoring.scorecard(rows, [])
-    assert sc["n"] == 2 and sc["brier_model"] < sc["brier_market"] and sc["skill_model"] > 0
-    assert "far too small" in scoring.format_scorecard(sc)
+def excluded(m, prefixes=None):
+    """True if the market's ticker or event ticker starts with any EXCLUDE_SERIES prefix (case-insensitive)."""
+    raw = C.EXCLUDE_SERIES if prefixes is None else prefixes
+    pre = tuple(x.strip().upper() for x in raw.split(",") if x.strip())
+    return bool(pre) and (m["ticker"].upper().startswith(pre) or m["event_ticker"].upper().startswith(pre))
 
 
-def test_estimator_parsing():
-    assert estimator.extract_json('thinking... {"a": 1} final {"probability": 0.3, "confidence": "high"}')["probability"] == 0.3
-    assert estimator.extract_json("no json") is None
-    n = estimator.normalize({"probability": 62, "confidence": "HIGH", "resolution_risk": "weird", "rationale": "x", "key_uncertainties": "one"})
-    assert n["p"] == 0.62 and n["confidence"] == "high" and n["resolution_risk"] == "medium" and n["uncertainties"] == ["one"]
-    assert estimator.normalize({"probability": -1}) is None and estimator.normalize({"probability": 0.999})["p"] == 0.99
+def structural_ok(m, lo_ts, hi_ts):
+    """Cheap filters applied before any model call."""
+    if m["market_type"] != "binary" or m["status"] != "active" or m["is_mve"] or not m["two_sided"]:
+        return False
+    if not m["close_ts"] or not (lo_ts <= m["close_ts"] <= hi_ts):
+        return False
+    if not (C.MIN_MID <= m["mid"] <= C.MAX_MID) or m["spread"] > C.MAX_SPREAD:
+        return False
+    if m["volume"] < C.MIN_VOLUME:
+        return False
+    sizes = [s for s in (m["bid_size"], m["ask_size"]) if s is not None]
+    return not sizes or min(sizes) >= C.MIN_TOP_SIZE
 
 
-# ---------------------------------------------------------------- auth / signing
-def test_signing_rsa_and_ed25519():
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding, ed25519
-    from cryptography.hazmat.primitives import hashes, serialization
-    pem = b""
-    for kind in ("rsa", "ed"):
-        key = rsa.generate_private_key(65537, 2048) if kind == "rsa" else ed25519.Ed25519PrivateKey.generate()
-        pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
-        h = auth.Signer("key-id", pem).headers("post", "/trade-api/v2/portfolio/events/orders?x=1")
-        assert h["KALSHI-ACCESS-KEY"] == "key-id" and len(h["KALSHI-ACCESS-TIMESTAMP"]) == 13
-        msg = (h["KALSHI-ACCESS-TIMESTAMP"] + "POST/trade-api/v2/portfolio/events/orders").encode()
-        sig = base64.b64decode(h["KALSHI-ACCESS-SIGNATURE"])
-        if kind == "rsa":
-            key.public_key().verify(sig, msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-        else:
-            key.public_key().verify(sig, msg)
-    assert auth.base_path("https://external-api.demo.kalshi.co/trade-api/v2/") == "/trade-api/v2"
-    with cfg(KALSHI_PRIVATE_KEY_B64=base64.b64encode(pem).decode(), KALSHI_PRIVATE_KEY="", KALSHI_PRIVATE_KEY_PATH=""):
-        assert auth.load_pem() == pem
+class Kalshi:
+    def __init__(self, base_url=None):
+        self.base = (base_url or C.KALSHI_BASE_URL).rstrip("/")
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": "Claude-Kalshi-Bot/1.0 (read-only market data)", "Accept": "application/json"})
+        self._events = {}
 
+    def _get(self, path, params=None):
+        for attempt in range(4):
+            time.sleep(0.25)
+            try:
+                r = self.s.get(self.base + path, params=params, timeout=30)
+            except requests.RequestException as e:
+                log.warning("request error %s: %s", path, e)
+                time.sleep(2 * (attempt + 1))
+                continue
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429 or r.status_code >= 500:
+                try:
+                    wait = int(r.headers.get("Retry-After", 0))
+                except ValueError:
+                    wait = 0
+                log.warning("HTTP %s for %s; backing off", r.status_code, path)
+                time.sleep(min(max(wait, 5 * (attempt + 1)), 60))
+                continue
+            raise KalshiError(r.status_code, r.text[:200])
+        raise KalshiError(0, f"{path} unreachable after retries")
 
-class FakeResp:
-    def __init__(self, status, body):
-        self.status_code, self._b, self.text = status, body, json.dumps(body)
-    def json(self): return self._b
-    def raise_for_status(self): assert self.status_code < 400
+    def _pages(self, params, drop=()):
+        """All pages of GET /markets (bounded by MAX_PAGES). If Kalshi rejects an optional filter, retry without it."""
+        out, cursor, params = [], None, dict(params)
+        for page in range(C.MAX_PAGES):
+            q = dict(params, **({"cursor": cursor} if cursor else {}))
+            try:
+                data = self._get("/markets", q)
+            except KalshiError as e:
+                if e.status == 400 and page == 0 and any(k in params for k in drop):
+                    for k in drop:
+                        params.pop(k, None)
+                    log.warning("Kalshi rejected %s (%s); retrying without it", drop, e)
+                    data = self._get("/markets", dict(params))
+                else:
+                    raise
+            out += data.get("markets", [])
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return out
 
+    def candidates(self):
+        now = int(time.time())
+        lo, hi = now + int(C.CLOSE_MIN_HOURS * 3600), now + int(C.CLOSE_MAX_DAYS * 86400)
+        raws = []
+        if C.SERIES:
+            for s in (x.strip() for x in C.SERIES.split(",") if x.strip()):
+                raws += self._pages({"series_ticker": s, "status": "open", "limit": 1000})
+        else:   # close-time filters can't be combined with status=open, so status is filtered locally
+            raws = self._pages({"min_close_ts": lo, "max_close_ts": hi, "mve_filter": "exclude", "limit": 1000},
+                               drop=("mve_filter",))
+        parsed = [parse_market(r) for r in raws]
+        out = [m for m in parsed if structural_ok(m, lo, hi)]
+        n_ok = len(out)
+        out = [m for m in out if not excluded(m)]
+        log.info("scanned %d markets, %d pass the structural filters%s", len(parsed), len(out),
+                 f" ({n_ok - len(out)} more excluded by EXCLUDE_SERIES)" if n_ok != len(out) else "")
+        return out
 
-def _kbroker(handler):
-    with cfg(KALSHI_API_KEY_ID="kid", KALSHI_PRIVATE_KEY=_pem(), KALSHI_PRIVATE_KEY_B64="", TRADING_MODE="demo",
-             KALSHI_BASE_URL="https://external-api.demo.kalshi.co/trade-api/v2"):
-        b = trader.KalshiBroker()
-    b.s = type("S", (), {"request": staticmethod(handler)})
-    return b
+    def markets_by_tickers(self, tickers):
+        """{ticker: parsed market} for the given tickers (used to refresh prices and to read settlement results)."""
+        out = {}
+        tickers = list(tickers)
+        for i in range(0, len(tickers), 50):
+            data = self._get("/markets", {"tickers": ",".join(tickers[i:i + 50]), "limit": 100})
+            for r in data.get("markets", []):
+                m = parse_market(r)
+                out[m["ticker"]] = m
+        return out
 
-
-def test_kalshi_broker_orders():
-    seen = {}
-    def ok(method, url, headers=None, json=None, timeout=None):
-        seen.update(method=method, url=url, body=json, headers=headers)
-        return FakeResp(201, {"order_id": "o1", "fill_count": "10.00", "remaining_count": "0.00", "average_fill_price": "0.4300", "average_fee_paid": "0.0170"})
-    b = _kbroker(ok)
-    r = b.place("T", "yes", 10, 0.44, "cid")
-    assert seen["url"].endswith("/trade-api/v2/portfolio/events/orders") and seen["method"] == "POST"
-    assert seen["body"]["side"] == "bid" and seen["body"]["price"] == "0.4400" and seen["body"]["count"] == "10.00"
-    assert seen["body"]["time_in_force"] == "immediate_or_cancel" and seen["body"]["client_order_id"] == "cid"
-    assert "KALSHI-ACCESS-SIGNATURE" in seen["headers"]
-    assert r["status"] == "filled" and abs(r["avg_cost"] - 0.43) < 1e-9 and abs(r["fee_total"] - 0.17) < 1e-9
-    r = b.place("T", "no", 10, 0.60, "cid2")
-    assert seen["body"]["side"] == "ask" and seen["body"]["price"] == "0.4000"
-    assert abs(r["avg_cost"] - 0.57) < 1e-9
-    assert _kbroker(lambda *a, **k: FakeResp(201, {"order_id": "o", "fill_count": "4.00", "average_fill_price": "0.44", "average_fee_paid": "0.02"})).place("T", "yes", 10, 0.44, "c")["status"] == "partial"
-    assert _kbroker(lambda *a, **k: FakeResp(201, {"order_id": "o", "fill_count": "0.00"})).place("T", "yes", 10, 0.44, "c")["status"] == "unfilled"
-    assert _kbroker(lambda *a, **k: FakeResp(400, {"message": "bad"})).place("T", "yes", 1, 0.4, "c")["status"] == "rejected"
-    assert _kbroker(lambda *a, **k: FakeResp(429, {})).place("T", "yes", 1, 0.4, "c")["status"] == "rejected"
-    assert _kbroker(lambda *a, **k: FakeResp(500, {})).place("T", "yes", 1, 0.4, "c")["status"] == "unknown"
-    assert _kbroker(lambda *a, **k: FakeResp(409, {})).place("T", "yes", 1, 0.4, "c")["status"] == "unknown"
-    import requests
-    def boom(*a, **k): raise requests.ConnectionError("timeout")
-    assert _kbroker(boom).place("T", "yes", 1, 0.4, "c")["status"] == "unknown"
-    calls = []
-    def count(*a, **k):
-        calls.append(1); return FakeResp(500, {})
-    _kbroker(count).place("T", "yes", 1, 0.4, "c")
-    assert len(calls) == 1
-    assert _kbroker(lambda m, u, **k: FakeResp(200, {"balance": 12345, "portfolio_value": 0})).balance() == 123.45
-    assert _kbroker(lambda m, u, **k: FakeResp(200, {"balance": 1, "balance_dollars": "99.5000"})).balance() == 99.5
-
-
-# ---------------------------------------------------------------- config validation
-def test_validate_config():
-    demo, prod = "https://external-api.demo.kalshi.co/trade-api/v2", "https://external-api.kalshi.com/trade-api/v2"
-    with cfg(TRADING_MODE="off"):
-        assert trader.validate_config() == []
-    with cfg(TRADING_MODE="paper", KALSHI_BASE_URL=prod):
-        assert trader.validate_config() == []
-    with cfg(TRADING_MODE="demo", KALSHI_BASE_URL=prod):
-        assert any("REAL exchange" in e for e in trader.validate_config())
-    with cfg(TRADING_MODE="live", KALSHI_BASE_URL=prod, LIVE_TRADING_CONFIRM=""):
-        assert any("LIVE_TRADING_CONFIRM" in e for e in trader.validate_config())
-    with cfg(TRADING_MODE="live", KALSHI_BASE_URL=demo, LIVE_TRADING_CONFIRM=C.LIVE_PHRASE):
-        assert any("demo environment" in e for e in trader.validate_config())
-    with cfg(TRADING_MODE="live", KALSHI_BASE_URL=prod, LIVE_TRADING_CONFIRM=C.LIVE_PHRASE, KALSHI_API_KEY_ID="", KALSHI_PRIVATE_KEY="",
-             KALSHI_PRIVATE_KEY_B64="", KALSHI_PRIVATE_KEY_PATH=""):
-        assert any("credentials" in e for e in trader.validate_config())
-    with cfg(TRADING_MODE="paper", MAX_ORDER_USD=0):
-        assert any("MAX_ORDER_USD" in e for e in trader.validate_config())
-
-
-# ---------------------------------------------------------------- sizing + plan + execute
-def test_sizing_math():
-    assert trader.fee_total(0.5, 100) == 1.75 and trader.fee_total(0.5, 1) == 0.02
-    assert trader.kelly_stake(0.5, 0.5, 100) == 0.0 and trader.kelly_stake(0.4, 0.5, 100) == 0.0
-    with cfg(KELLY_FRACTION=0.25):
-        assert abs(trader.kelly_stake(0.60, 0.50, 100) - 0.25 * 0.2 * 100) < 1e-9
-    n = trader.contracts_for(10.0, 0.44)
-    assert n * 0.44 + trader.fee_total(0.44, n) <= 10.0 and (n + 1) * 0.44 + trader.fee_total(0.44, n + 1) > 10.0
-    assert trader.contracts_for(0.30, 0.44) == 0
-
-
-class FakeKal:
-    def __init__(self, m): self.m = m
-    def refresh(self, t): return self.m
-    def question(self, m): return "Will it?"
-
-
-class FakeBroker:
-    name = "fake"
-    def __init__(self, cash=100.0, result=None):
-        self.cash, self.result, self.calls = cash, result, []
-    def balance(self): return self.cash
-    def place(self, ticker, side, contracts, limit, cid):
-        self.calls.append((ticker, side, contracts, limit, cid))
-        return self.result or {"status": "filled", "order_id": "x1", "fill_count": float(contracts), "avg_cost": limit,
-                               "fee_total": trader.fee_total(limit, contracts), "error": ""}
-
-
-def _est(db, p_adj=0.65, side="yes", ticker="KXTEST-26NOV01-T5", price=0.44, alerted=1, ts=None):
-    m = kalshi.parse_market(raw_market(ticker=ticker))
-    row = dict(ts=ts or time.time(), ticker=ticker, event_ticker="KXTEST-26NOV01", title="Q", close_time=m["close_time"], close_ts=m["close_ts"],
-               model="m", p_model=0.7, p_adj=p_adj, confidence="high", resolution_risk="low", rationale="r", uncertainties="[]",
-               yes_bid=0.40, yes_ask=0.44, no_ask=0.60, mid=0.42, spread=0.04, volume=5000, open_interest=900, side=side, price=price,
-               fee=0.017, edge=0.16, status="alert", alerted=alerted, in_tok=1, out_tok=1, searches=0)
-    return db.add_estimate(row)
-
-
-@contextlib.contextmanager
-def trading(**kw):
-    base = dict(TRADING_MODE="paper", KALSHI_BASE_URL="https://external-api.kalshi.com/trade-api/v2", MAX_ORDER_USD=10, MAX_DAILY_USD=25,
-                MAX_PER_MARKET_USD=10, MAX_OPEN_POSITIONS=5, MIN_CASH_RESERVE_USD=5, MAX_DAILY_LOSS_USD=15, MIN_EDGE=0.05,
-                MAX_SLIPPAGE=0.02, KELLY_FRACTION=0.25, BANKROLL_USD=0.0, TRADE_BUTTON_TTL_MIN=30)
-    base.update(kw)
-    with cfg(**base):
-        yield
-
-
-def test_execute_happy_path_and_idempotency():
-    db = DB(tempfile.mkdtemp()); eid = _est(db); kal = FakeKal(kalshi.parse_market(raw_market())); br = FakeBroker()
-    with trading():
-        out = trader.execute(db, kal, br, eid, "manual")
-        assert out["ok"] and out["plan"]["contracts"] >= 1 and out["plan"]["cost"] <= 10.0
-        assert br.calls[0][1] == "yes" and br.calls[0][3] == 0.44
-        o = db.order_for_estimate(eid)
-        assert o["status"] == "filled" and o["mode"] == "paper" and o["cost_total"] > 0 and db.get_estimate(eid)["decision"] == "approved"
-        again = trader.execute(db, kal, br, eid, "manual")
-        assert not again["ok"] and "already exists" in again["reason"] and len(br.calls) == 1
-
-
-def test_guards():
-    kal = FakeKal(kalshi.parse_market(raw_market()))
-    def attempt(prep=None, est_kw=None, market=None, cash=100.0, **cfg_kw):
-        db = DB(tempfile.mkdtemp()); eid = _est(db, **(est_kw or {})); br = FakeBroker(cash=cash)
-        if prep: prep(db)
-        with trading(**cfg_kw):
-            return trader.execute(db, FakeKal(market) if market else kal, br, eid, "manual"), br, db
-    out, br, _ = attempt(TRADING_MODE="off"); assert not out["ok"] and not br.calls and "off" in out["reason"]
-    out, br, _ = attempt(prep=lambda d: d.set_kv("halt_trading", "1")); assert "HALTED" in out["reason"] and not br.calls
-    out, br, _ = attempt(est_kw=dict(ts=time.time() - 3600)); assert "stale" in out["reason"] and not br.calls
-    out, br, _ = attempt(est_kw=dict(alerted=0)); assert "not an alert" in out["reason"]
-    out, br, _ = attempt(market=kalshi.parse_market(raw_market(yes_ask_dollars="0.5000", no_bid_dollars="0.5000", no_ask_dollars="0.6000")))
-    assert not br.calls and ("slippage" in out["reason"] or "edge" in out["reason"])
-    out, br, _ = attempt(est_kw=dict(p_adj=0.43)); assert not br.calls and "edge" in out["reason"]
-    out, br, _ = attempt(market=kalshi.parse_market(raw_market(status="closed"))); assert "not actively quoted" in out["reason"]
-    out, br, _ = attempt(cash=5.2); assert "cash reserve" in out["reason"] and not br.calls
-    out, br, _ = attempt(BANKROLL_USD=1.0); assert "Kelly" in out["reason"] and not br.calls
-    out, br, _ = attempt(MAX_DAILY_USD=0.30); assert "daily spend" in out["reason"]
-    def lost(db):
-        db.reserve_order(dict(estimate_id=999, ts=time.time(), mode="paper", source="m", ticker="Z", side="yes", contracts=1, limit_price=0.5, client_order_id="c", status="pending"))
-        oid = db.order_for_estimate(999)["id"]
-        db.update_order(oid, status="filled", fill_count=1, avg_cost=0.5, cost_total=0.5, fee_total=0.02, pnl=-16.0, settled_ts=time.time())
-    out, br, _ = attempt(prep=lost); assert "daily loss limit" in out["reason"] and not br.calls
-    def holds_no(db):
-        db.reserve_order(dict(estimate_id=998, ts=time.time(), mode="paper", source="m", ticker="KXTEST-26NOV01-T5", side="no", contracts=3, limit_price=0.6, client_order_id="c9", status="pending"))
-    out, br, _ = attempt(prep=holds_no); assert "already hold NO" in out["reason"] and not br.calls
-    def full(db):
-        for i in range(2):
-            db.reserve_order(dict(estimate_id=900 + i, ts=time.time(), mode="paper", source="m", ticker=f"O{i}", side="yes", contracts=1, limit_price=0.5, client_order_id=f"c{i}", status="pending"))
-    out, br, _ = attempt(prep=full, MAX_OPEN_POSITIONS=2); assert "open positions" in out["reason"] and not br.calls
-    def exposed(db):
-        db.reserve_order(dict(estimate_id=997, ts=time.time(), mode="paper", source="m", ticker="KXTEST-26NOV01-T5", side="yes", contracts=20, limit_price=0.5, client_order_id="cx", status="pending"))
-    out, br, _ = attempt(prep=exposed); assert "per-market" in out["reason"] and not br.calls
-    out, br, db = attempt(); assert out["ok"]
-
-
-def test_unknown_order_halts_and_resolves():
-    db = DB(tempfile.mkdtemp()); eid = _est(db); kal = FakeKal(kalshi.parse_market(raw_market()))
-    br = FakeBroker(result={"status": "unknown", "error": "network error"})
-    with trading():
-        out = trader.execute(db, kal, br, eid, "manual")
-        assert not out["ok"] and db.get_kv("halt_trading") == "1" and db.order_for_estimate(eid)["status"] == "unknown"
-        assert "ORDER STATE UNKNOWN" in telegram.format_order_result(out) and "/resolve" in telegram.format_order_result(out)
-        assert db.orders_spend_since(0, "paper") > 0
-        eid2 = _est(db, ticker="OTHER-1")
-        assert "HALTED" in trader.execute(db, kal, FakeBroker(), eid2, "manual")["reason"]
-        oid = db.order_for_estimate(eid)["id"]
-        assert "not placed" in trader.resolve_unknown(db, oid, "none") and db.order_for_estimate(eid)["status"] == "failed"
-        assert trader.resolve_unknown(db, oid, "none") == "no such unknown order"
-
-
-def test_rejected_and_unfilled_do_not_count():
-    db = DB(tempfile.mkdtemp()); eid = _est(db); kal = FakeKal(kalshi.parse_market(raw_market()))
-    with trading():
-        out = trader.execute(db, kal, FakeBroker(result={"status": "unfilled", "fill_count": 0.0, "error": ""}), eid, "manual")
-        assert not out["ok"] and db.orders_spend_since(0, "paper") == 0 and db.get_kv("halt_trading") is None
-        assert "NOT FILLED" in telegram.format_order_result(out)
-        assert not db.open_orders("paper")
-
-
-def test_paper_broker_and_settlement():
-    db = DB(tempfile.mkdtemp()); eid = _est(db); kal = FakeKal(kalshi.parse_market(raw_market()))
-    with trading(PAPER_BANKROLL_USD=100):
-        pb = trader.PaperBroker(db)
-        assert pb.balance() == 100
-        out = trader.execute(db, kal, pb, eid, "auto")
-        assert out["ok"] and pb.balance() < 100 and db.get_estimate(eid)["decision"] == "auto-bought"
-        o = db.order_for_estimate(eid); cost = o["cost_total"] + o["fee_total"]
-        sent = []
-        saved = telegram.send; telegram.send = lambda t, b=None: sent.append(t)
+    def refresh(self, ticker):
         try:
-            r = dict(db.get_estimate(eid))
-            assert M.settle_order(db, r, 1, False)
-            o = db.order_for_estimate(eid)
-            assert abs(o["pnl"] - (o["fill_count"] - cost)) < 1e-6 and o["pnl"] > 0
-            assert "settled YES" in sent[0] and not M.settle_order(db, r, 1, False)
-            assert abs(pb.balance() - (100 + o["pnl"])) < 1e-6
-            eid2 = _est(db, ticker="LOSER-1"); trader.execute(db, kal, pb, eid2, "manual")
-            M.settle_order(db, dict(db.get_estimate(eid2)), 0, False)
-            o2 = db.order_for_estimate(eid2)
-            assert o2["pnl"] < 0 and abs(o2["pnl"] + o2["cost_total"] + o2["fee_total"]) < 1e-6
-        finally:
-            telegram.send = saved
-        assert "PAPER" in control.trading_summary(db)
+            return self.markets_by_tickers([ticker]).get(ticker)
+        except KalshiError as e:
+            log.warning("refresh failed for %s: %s", ticker, e)
+            return None
 
-
-def test_no_side_pnl():
-    db = DB(tempfile.mkdtemp()); eid = _est(db, p_adj=0.2, side="no", price=0.60); kal = FakeKal(kalshi.parse_market(raw_market()))
-    with trading():
-        out = trader.execute(db, kal, FakeBroker(), eid, "manual"); assert out["ok"] and out["plan"]["side"] == "no"
-        saved = telegram.send; telegram.send = lambda *a, **k: None
-        try:
-            M.settle_order(db, dict(db.get_estimate(eid)), 0, False)
-        finally:
-            telegram.send = saved
-        assert db.order_for_estimate(eid)["pnl"] > 0
-
-
-def test_auto_mode_gating_and_buttons():
-    est = dict(confidence="high")
-    with cfg(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_CONFIDENCE="high", AUTO_MIN_EDGE=0.08):
-        assert M.wants_auto(est, 0.09) and not M.wants_auto(est, 0.06) and not M.wants_auto(dict(confidence="medium"), 0.2)
-    with cfg(TRADING_MODE="paper", TRADE_APPROVAL="manual"):
-        assert not M.wants_auto(est, 0.5)
-    with cfg(TRADING_MODE="off", TRADE_APPROVAL="auto"):
-        assert not M.wants_auto(est, 0.5) and M.alert_buttons(7)[0][1] == "d:a:7"
-    with cfg(TRADING_MODE="paper"):
-        assert M.alert_buttons(7)[0] == ("💰 Buy", "t:7")
-
-
-# ---------------------------------------------------------------- Telegram control flow
-def test_control_buy_flow():
-    sent, acks, cleared = [], [], []
-    saved = (telegram.send, telegram.answer_callback, telegram.clear_buttons)
-    telegram.send = lambda t, b=None: sent.append((t, b)); telegram.answer_callback = lambda i, t: acks.append(t)
-    telegram.clear_buttons = lambda c, m: cleared.append(m)
-    try:
-        db = DB(tempfile.mkdtemp()); eid = _est(db); kal = FakeKal(kalshi.parse_market(raw_market())); br = FakeBroker()
-        cb = lambda data, chat="42": {"update_id": 1, "callback_query": {"id": "x", "data": data, "message": {"message_id": 5, "chat": {"id": int(chat)}}}}
-        with trading(TELEGRAM_CHAT_ID="42"):
-            control.handle_update(db, cb(f"t:{eid}", chat="999"), kal, br)
-            assert not br.calls and not acks
-            control.handle_update(db, cb(f"t:{eid}"), kal, br)
-            assert len(br.calls) == 1 and "FILLED" in sent[-1][0]
-            control.handle_update(db, cb(f"t:{eid}"), kal, br)
-            assert len(br.calls) == 1 and "already exists" in sent[-1][0]
-        db = DB(tempfile.mkdtemp()); eid = _est(db); br = FakeBroker(); sent.clear()
-        with trading(TELEGRAM_CHAT_ID="42", TRADING_MODE="live", LIVE_TRADING_CONFIRM=C.LIVE_PHRASE, KALSHI_API_KEY_ID="k", KALSHI_PRIVATE_KEY=_pem()):
-            control.handle_update(db, cb(f"t:{eid}"), kal, br)
-            assert not br.calls and "Confirm LIVE order" in sent[-1][0] and sent[-1][1][0][1] == f"y:{eid}"
-            control.handle_update(db, cb(f"x:{eid}"), kal, br); assert not br.calls and "Cancelled" in acks[-1]
-            control.handle_update(db, cb(f"y:{eid}"), kal, br)
-            assert len(br.calls) == 1 and db.order_for_estimate(eid)["mode"] == "live"
-        db = DB(tempfile.mkdtemp()); eid = _est(db); br = FakeBroker(); sent.clear()
-        msg = lambda t, chat=42: {"update_id": 2, "message": {"text": t, "chat": {"id": chat}}}
-        with trading(TELEGRAM_CHAT_ID="42"):
-            control.handle_update(db, msg("/halt"), kal, br); assert db.get_kv("halt_trading") == "1"
-            control.handle_update(db, cb(f"t:{eid}"), kal, br); assert not br.calls and "HALTED" in sent[-1][0]
-            control.handle_update(db, msg("/unhalt"), kal, br); assert db.get_kv("halt_trading") == "0"
-            control.handle_update(db, msg("/halt", chat=7), kal, br); assert db.get_kv("halt_trading") == "0"
-            control.handle_update(db, msg("/balance"), kal, br); assert "$100.00" in sent[-1][0]
-            control.handle_update(db, msg("/orders"), kal, br); control.handle_update(db, msg("/pnl"), kal, br); control.handle_update(db, msg("/status"), kal, br)
-            db.reserve_order(dict(estimate_id=77, ts=time.time(), mode="paper", source="m", ticker="U", side="yes", contracts=1, limit_price=0.5, client_order_id="u", status="unknown"))
-            db.set_kv("halt_trading", "1"); control.handle_update(db, msg("/unhalt"), kal, br)
-            assert "unknown state" in sent[-1][0] and db.get_kv("halt_trading") == "1"
-            oid = db.order_for_estimate(77)["id"]
-            control.handle_update(db, msg(f"/resolve {oid} none"), kal, br); control.handle_update(db, msg("/unhalt"), kal, br)
-            assert db.get_kv("halt_trading") == "0"
-    finally:
-        telegram.send, telegram.answer_callback, telegram.clear_buttons = saved
-
-
-# ---------------------------------------------------------------- full cycle with everything mocked
-def test_full_cycle_alert_then_settle():
-    m = kalshi.parse_market(raw_market())
-    class K(FakeKal):
-        def candidates(self): return [m]
-        def markets_by_tickers(self, ts):
-            return {t: kalshi.parse_market(raw_market(status="finalized", result="yes")) for t in ts}
-    kal = K(m)
-    sent = []
-    saved = (telegram.send, estimator.estimate)
-    telegram.send = lambda t, b=None: sent.append((t, b))
-    estimator.estimate = lambda q, mk: dict(p=0.80, confidence="high", resolution_risk="low", rationale="because", uncertainties=["u"], in_tok=10, out_tok=5, searches=1)
-    try:
-        db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="off"), cfg(MIN_EDGE=0.05, MODEL_WEIGHT=1.0, MIN_VOLUME=100, CLOSE_MIN_HOURS=0, MAX_MODEL_GAP=0.5):
-            M.run_cycle(db, kal, None, False)
-            assert len(sent) == 1 and "BUY YES" in sent[0][0] and sent[0][1][0][1].startswith("d:a:")
-        db2 = DB(tempfile.mkdtemp()); sent.clear()
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.08), cfg(MODEL_WEIGHT=1.0, MIN_VOLUME=100, MAX_MODEL_GAP=0.5):
-            M.run_cycle(db2, kal, trader.PaperBroker(db2), False)
-            assert "Auto-trade is on" in sent[0][0] and "FILLED" in sent[1][0]
-            db2.c.execute("UPDATE estimates SET close_ts=1"); db2.c.commit()
-            assert M.settle(db2, kal, False) == 1
-            assert db2.order_for_estimate(1)["pnl"] > 0 and any("settled YES" in s[0] for s in sent)
-    finally:
-        telegram.send, estimator.estimate = saved
-
-
-# ---------------------------------------------------------------- OpenAI provider
-def test_openai_provider():
-    m = kalshi.parse_market(raw_market())
-    reply = {"status": "completed", "usage": {"input_tokens": 1200, "output_tokens": 300}, "output": [
-        {"type": "reasoning"}, {"type": "web_search_call", "action": {"type": "search", "query": "x"}},
-        {"type": "web_search_call", "action": {"type": "open_page"}}, {"type": "web_search_call", "action": {"type": "search"}},
-        {"type": "message", "content": [{"type": "output_text", "text": 'ok {"probability": 0.31, "confidence": "high", "rationale": "r", "key_uncertainties": ["a"]}', "annotations": []}]}]}
-    text, searches, i, o = estimator.parse_openai(reply)
-    assert searches == 2 and (i, o) == (1200, 300) and '"probability"' in text
-    seen = {}
-    def fake(body):
-        seen.setdefault("bodies", []).append(body)
-        return FakeResp(200, reply)
-    saved = estimator._post_openai; estimator._post_openai = fake
-    try:
-        with cfg(PROVIDER="openai", OPENAI_API_KEY="k", OPENAI_MODEL="gpt-6.1-sol", USE_WEB_SEARCH=True):
-            est = estimator.estimate("Will it?", m)
-        b = seen["bodies"][0]
-        assert est["p"] == 0.31 and est["confidence"] == "high" and est["searches"] == 2 and est["in_tok"] == 1200
-        assert b["model"] == "gpt-6.1-sol" and b["tools"][0]["type"] == "web_search" and "price" not in b["input"].lower()
-        assert b["instructions"] == estimator.SYSTEM and b["reasoning"]["effort"] == "low" and b["max_output_tokens"] == 6000
-        # a 400 caused by the web-search tool falls back to a no-search call
-        calls = []
-        def reject_tools(body):
-            calls.append(body)
-            return FakeResp(400, {"error": "tools not supported"}) if "tools" in body else FakeResp(200, reply)
-        estimator._post_openai = reject_tools; estimator._tools_ok = True
-        with cfg(PROVIDER="openai", OPENAI_API_KEY="k"):
-            assert estimator.estimate("Will it?", m)["p"] == 0.31
-        assert len(calls) == 2 and "tools" not in calls[1]
-        estimator._tools_ok = True
-        estimator._post_openai = lambda body: FakeResp(200, {"output": [{"type": "message", "content": [{"type": "output_text", "text": "no json"}]}]})
-        with cfg(PROVIDER="openai"):
-            assert estimator.estimate("Will it?", m) is None
-        estimator._post_openai = lambda body: FakeResp(401, {})
-        with cfg(PROVIDER="openai"):
-            assert estimator.estimate("Will it?", m) is None
-    finally:
-        estimator._post_openai = saved; estimator._tools_ok = True
-    # Anthropic stays the default path
-    sent = []
-    saved_a = estimator._estimate_anthropic; estimator._estimate_anthropic = lambda q, mk: sent.append(1) or {"p": 0.5}
-    try:
-        with cfg(PROVIDER="anthropic"):
-            estimator.estimate("q", m)
-        assert sent
-    finally:
-        estimator._estimate_anthropic = saved_a
-
-
-# ---------------------------------------------------------------- sanity checks
-def test_extreme_gap_and_pair_consistency():
-    db = DB(tempfile.mkdtemp())
-    a = kalshi.parse_market(raw_market(ticker="EV-A", event_ticker="EV"))          # mid 0.42
-    b = kalshi.parse_market(raw_market(ticker="EV-B", event_ticker="EV", yes_bid_dollars="0.5600", yes_ask_dollars="0.6000"))  # mid 0.58
-    est = lambda p, conf="high": {"p": p, "confidence": conf, "resolution_risk": "low"}
-    with cfg(MIN_EDGE=0.05, MIN_CONFIDENCE="medium", MAX_MODEL_GAP=0.25, PAIR_TOLERANCE=0.15, MAX_ALERTS_PER_DAY=0, COOLDOWN_HOURS=72):
-        assert M.decide(db, est(0.60), 0.15, "yes", a) == "alert"                  # gap 0.18: fine
-        assert M.decide(db, est(0.80), 0.30, "yes", a) == "extreme_gap"            # gap 0.38
-        assert M.decide(db, est(0.05), 0.30, "no", a) == "extreme_gap"
-        assert M.decide(db, est(0.80), 0.01, "yes", a) == "no_edge"                # existing checks keep priority
-        with cfg(MAX_MODEL_GAP=0):
-            assert M.decide(db, est(0.80), 0.30, "yes", a) == "alert"
-        # sibling pair
-        db.add_estimate(dict(_row(db, "EV-A", "EV"), p_model=0.60, mid=0.42))
-        assert M.decide(db, est(0.40), 0.10, "yes", b) == "alert"                  # 0.60 + 0.40 = 1.0: coherent
-        assert M.decide(db, est(0.55), 0.10, "yes", b) == "alert"                  # sum 1.15 is exactly the tolerance edge (within 0.15)
-        assert M.decide(db, est(0.75), 0.10, "yes", b) == "inconsistent"           # 0.60 + 0.75 = 1.35
-        with cfg(PAIR_TOLERANCE=0):
-            assert M.decide(db, est(0.75), 0.10, "yes", b) == "alert"
-        far = kalshi.parse_market(raw_market(ticker="EV-C", event_ticker="EV", yes_bid_dollars="0.1000", yes_ask_dollars="0.1400"))
-        assert M.decide(db, est(0.30), 0.10, "yes", far) == "alert"                # mids do not sum to ~1: not treated as complementary
-        other = kalshi.parse_market(raw_market(ticker="ZZ-A", event_ticker="ZZ"))
-        assert M.decide(db, est(0.60), 0.10, "yes", other) == "alert"              # different event: no sibling check
-
-
-def _row(db, ticker, event):
-    eid = _est(db, ticker=ticker)
-    r = dict(db.get_estimate(eid))
-    db.c.execute("DELETE FROM estimates WHERE id=?", (eid,)); db.c.commit()
-    r["event_ticker"] = event
-    for k in ("id", "settle_status", "outcome", "settled_ts", "pnl", "decision"):
-        r.pop(k, None)
-    return r
-
-
-def test_exclude_series():
-    t = kalshi.parse_market(raw_market(ticker="KXATPCHALLENGERMATCH-26OCT28BRODIE-BRO", event_ticker="KXATPCHALLENGERMATCH-26OCT28BRODIE"))
-    w = kalshi.parse_market(raw_market(ticker="KXWTACHALLENGERMATCH-26OCT28STEAKS-STE", event_ticker="KXWTACHALLENGERMATCH-26OCT28STEAKS"))
-    c = kalshi.parse_market(raw_market(ticker="KXCPI-26NOV-T3", event_ticker="KXCPI-26NOV"))
-    pre = "KXATP, kxwta ,KXITF"
-    assert kalshi.excluded(t, pre) and kalshi.excluded(w, pre) and not kalshi.excluded(c, pre)
-    assert not kalshi.excluded(t, "") and not kalshi.excluded(t, " , ")
-    assert kalshi.excluded(c, "KXCPI-26") and not kalshi.excluded(c, "CPI")      # prefix match only, not substring
-    with cfg(EXCLUDE_SERIES="KXATP"):
-        assert kalshi.excluded(t) and not kalshi.excluded(c)
-    class K(kalshi.Kalshi):
-        def __init__(self): pass
-        def _pages(self, params, drop=()): return [raw_market(ticker=x.pop(0), event_ticker="E") if False else r for r in rows]
-    rows = [raw_market(ticker="KXATP-1", event_ticker="KXATP-1"), raw_market(ticker="KXCPI-1", event_ticker="KXCPI-1")]
-    rows[0]["close_time"] = rows[1]["close_time"]
-    with cfg(EXCLUDE_SERIES="KXATP", SERIES="", CLOSE_MIN_HOURS=0, CLOSE_MAX_DAYS=30, MIN_VOLUME=100):
-        got = [m["ticker"] for m in K().candidates()]
-    assert got == ["KXCPI-1"], got
-    with cfg(EXCLUDE_SERIES="", SERIES="", CLOSE_MIN_HOURS=0, CLOSE_MAX_DAYS=30, MIN_VOLUME=100):
-        assert len(K().candidates()) == 2
-
-
-def test_notify_level_trades():
-    m = kalshi.parse_market(raw_market())
-    class K(FakeKal):
-        def candidates(self): return [m]
-        def markets_by_tickers(self, ts): return {t: kalshi.parse_market(raw_market(status="finalized", result="yes")) for t in ts}
-    kal = K(m)
-    sent = []
-    saved = (telegram.send, estimator.estimate)
-    telegram.send = lambda t, b=None: sent.append(t)
-    estimator.estimate = lambda q, mk: dict(p=0.60, confidence="high", resolution_risk="low", rationale="r", uncertainties=[], in_tok=1, out_tok=1, searches=0)
-    try:
-        common = dict(MODEL_WEIGHT=1.0, MIN_VOLUME=100, MAX_MODEL_GAP=0.5, CLOSE_MIN_HOURS=0, NOTIFY_LEVEL="trades")
-        # auto + trades: exactly one message, the fill
-        db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.05), cfg(**common):
-            M.run_cycle(db, kal, trader.PaperBroker(db), False)
-            assert len(sent) == 1 and "FILLED" in sent[0] and "KALSHI ALERT" not in sent[0]
-            db.c.execute("UPDATE estimates SET close_ts=1"); db.c.commit(); sent.clear()
-            M.settle(db, kal, False)
-            assert len(sent) == 1 and "settled" in sent[0]          # the executed position's result is still reported
-        # auto + trades, order refused by a guard (daily spend cap): nothing is sent
-        sent.clear(); db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.05, MAX_DAILY_USD=0.10), cfg(**common):
-            M.run_cycle(db, kal, trader.PaperBroker(db), False)
-            assert sent == []
-        # auto + trades, below the auto edge threshold: alert is not sent (no buttons to press in auto mode)
-        sent.clear(); db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.90), cfg(**common):
-            M.run_cycle(db, kal, trader.PaperBroker(db), False)
-            assert sent == []
-        # manual + trades: alert still sent (otherwise nothing could ever be bought)
-        sent.clear(); db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="manual"), cfg(**common):
-            M.run_cycle(db, kal, trader.PaperBroker(db), False)
-            assert len(sent) == 1 and "KALSHI ALERT" in sent[0]
-        # alert-only settlement is silent in trades mode, spoken in all mode
-        db.c.execute("UPDATE estimates SET close_ts=1"); db.c.commit(); sent.clear()
-        with trading(TRADING_MODE="off"), cfg(**common):
-            M.settle(db, kal, False)
-        assert sent == []
-        db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="off"), cfg(**dict(common, NOTIFY_LEVEL="all")):
-            M.run_cycle(db, kal, None, False); sent.clear()
-            db.c.execute("UPDATE estimates SET close_ts=1"); db.c.commit()
-            M.settle(db, kal, False)
-        assert len(sent) == 1 and "Settled" in sent[0]
-    finally:
-        telegram.send, estimator.estimate = saved
-    assert M.order_notable({"plan": {}, "result": {"status": "unknown"}}) and not M.order_notable({"plan": {}, "result": {"status": "unfilled"}})
-    assert not M.order_notable({"reason": "x"})
-
-
-if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            fn(); print("ok", name)
+    def question(self, m):
+        """Human-readable question: event title + the YES side. (Market 'title' is deprecated by Kalshi.)"""
+        ev = m["event_ticker"]
+        if ev not in self._events:
+            try:
+                data = self._get(f"/events/{ev}")
+                self._events[ev] = (data.get("event") or {}).get("title", "") or ""
+            except KalshiError as e:
+                log.warning("event lookup failed for %s: %s", ev, e)
+                self._events[ev] = ""
+        base = self._events[ev] or m["title"] or m["ticker"]
+        return f"{base} — YES means: {m['yes_sub_title']}" if m["yes_sub_title"] else base
