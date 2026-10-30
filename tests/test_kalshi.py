@@ -96,6 +96,43 @@ def test_signing_rsa_and_ed25519():
         assert auth.load_pem() == pem
 
 
+def test_private_key_any_paste_format():
+    """Railway's one-line field breaks PEM keys (MalformedFraming). Every common way of pasting must work."""
+    import textwrap
+    from cryptography.hazmat.primitives.asymmetric import rsa, ed25519
+    from cryptography.hazmat.primitives import serialization
+    for key in (rsa.generate_private_key(65537, 2048), ed25519.Ed25519PrivateKey.generate()):
+        for fmt in (serialization.PrivateFormat.PKCS8, serialization.PrivateFormat.TraditionalOpenSSL):
+            if isinstance(key, ed25519.Ed25519PrivateKey) and fmt != serialization.PrivateFormat.PKCS8:
+                continue
+            pem = key.private_bytes(serialization.Encoding.PEM, fmt, serialization.NoEncryption())
+            der = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+                                    serialization.NoEncryption())
+            t = pem.decode()
+            b64 = base64.b64encode(pem).decode()
+            pastes = {
+                "KALSHI_PRIVATE_KEY": [t, t.replace("\n", " "), t.replace("\n", "\\n"), '"' + t + '"',
+                                       t.replace("\n", "\r\n"), "  " + t.replace("\n", "  ") + "  "],
+                "KALSHI_PRIVATE_KEY_B64": [b64, "\n".join(textwrap.wrap(b64, 76)), t, t.replace("\n", " "),
+                                           base64.b64encode(der).decode(), b64.rstrip("=")],
+            }
+            for var, values in pastes.items():
+                for v in values:
+                    other = "KALSHI_PRIVATE_KEY" if var.endswith("B64") else "KALSHI_PRIVATE_KEY_B64"
+                    with cfg(**{var: v, other: "", "KALSHI_PRIVATE_KEY_PATH": "", "KALSHI_API_KEY_ID": " 'kid' "}):
+                        sg = auth.load_signer()
+                        assert sg.key_id == "kid"
+                        assert sg.key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+                                                    serialization.NoEncryption()) == der, (var, v[:40])
+    for bad in ("hello world", base64.b64encode(b"not a key").decode()):
+        with cfg(KALSHI_PRIVATE_KEY_B64=bad, KALSHI_PRIVATE_KEY="", KALSHI_PRIVATE_KEY_PATH=""):
+            try:
+                auth.load_signer()
+                raise AssertionError("bad key accepted")
+            except ValueError as e:
+                assert "KALSHI_PRIVATE_KEY_B64" in str(e) and bad[:5] not in str(e)      # never echo the key
+
+
 class FakeResp:
     def __init__(self, status, body):
         self.status_code, self._b, self.text = status, body, json.dumps(body)
