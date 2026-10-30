@@ -60,6 +60,9 @@ class DB:
                                  [row[k] for k in EST_COLS])
             return cur.lastrowid
 
+    def count_estimates_since(self, ts):
+        return self.c.execute("SELECT COUNT(*) FROM estimates WHERE ts>=?", (ts,)).fetchone()[0]
+
     def last_estimate(self, ticker):
         return self.c.execute("SELECT * FROM estimates WHERE ticker=? ORDER BY ts DESC LIMIT 1", (ticker,)).fetchone()
 

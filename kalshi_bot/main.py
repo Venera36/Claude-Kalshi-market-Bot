@@ -133,10 +133,25 @@ def run_cycle(db, kal, broker, dry):
         return
     cands = kal.candidates()
     for m in select(db, cands):
-        if db.bump(f"budget:{util.today()}") > C.DAILY_ESTIMATE_BUDGET:
+        if not budget_take(db):
             log.info("daily estimate budget (%d) reached", C.DAILY_ESTIMATE_BUDGET)
             break
         handle_market(db, kal, broker, m, dry)
+
+
+def budget_take(db):
+    """Use one estimate from today's budget, or return False when it is spent.
+    The check happens BEFORE counting: the old counter also went up on every skipped scan after the budget ran out,
+    so raising DAILY_ESTIMATE_BUDGET mid-day had no effect. A new day's counter starts from the estimates actually
+    stored today (this also repairs a day whose old counter was inflated)."""
+    key = f"est_budget:{util.today()}"
+    used = db.get_kv(key)
+    used = int(used) if used not in (None, "") else db.count_estimates_since(util.day_start_ts())
+    if used >= C.DAILY_ESTIMATE_BUDGET:
+        db.set_kv(key, used)
+        return False
+    db.set_kv(key, used + 1)
+    return True
 
 
 def settle_order(db, r, outcome, dry):

@@ -133,6 +133,25 @@ def test_private_key_any_paste_format():
                 assert "KALSHI_PRIVATE_KEY_B64" in str(e) and bad[:5] not in str(e)      # never echo the key
 
 
+def test_estimate_budget_counts_only_real_estimates():
+    import tempfile, time as _t
+    from kalshi_bot import main as M, util
+    from kalshi_bot.db import DB
+    db = DB(tempfile.mkdtemp())
+    db.set_kv(f"budget:{util.today()}", 47)                     # old inflated counter is ignored
+    for _ in range(20):                                           # 20 real estimates already made today
+        db.c.execute("INSERT INTO estimates(ts, ticker) VALUES(?, 'X')", (_t.time(),))
+    db.c.commit()
+    with cfg(DAILY_ESTIMATE_BUDGET=40):
+        took = sum(M.budget_take(db) for _ in range(25))
+        assert took == 20                                         # 40 - 20 already used
+        for _ in range(10):
+            assert M.budget_take(db) is False                     # skipped scans don't inflate the count
+        assert int(db.get_kv(f"est_budget:{util.today()}")) == 40
+    with cfg(DAILY_ESTIMATE_BUDGET=45):
+        assert sum(M.budget_take(db) for _ in range(10)) == 5     # raising the budget mid-day now works
+
+
 class FakeResp:
     def __init__(self, status, body):
         self.status_code, self._b, self.text = status, body, json.dumps(body)
