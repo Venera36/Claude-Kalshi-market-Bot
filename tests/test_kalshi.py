@@ -445,11 +445,11 @@ def test_full_cycle_alert_then_settle():
     estimator.estimate = lambda q, mk: dict(p=0.80, confidence="high", resolution_risk="low", rationale="because", uncertainties=["u"], in_tok=10, out_tok=5, searches=1)
     try:
         db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="off"), cfg(MIN_EDGE=0.05, MODEL_WEIGHT=1.0, MIN_VOLUME=100, CLOSE_MIN_HOURS=0):
+        with trading(TRADING_MODE="off"), cfg(MIN_EDGE=0.05, MODEL_WEIGHT=1.0, MIN_VOLUME=100, CLOSE_MIN_HOURS=0, MAX_MODEL_GAP=0):
             M.run_cycle(db, kal, None, False)
             assert len(sent) == 1 and "BUY YES" in sent[0][0] and sent[0][1][0][1].startswith("d:a:")
         db2 = DB(tempfile.mkdtemp()); sent.clear()
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.08), cfg(MODEL_WEIGHT=1.0, MIN_VOLUME=100):
+        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.08), cfg(MODEL_WEIGHT=1.0, MIN_VOLUME=100, MAX_MODEL_GAP=0):
             M.run_cycle(db2, kal, trader.PaperBroker(db2), False)
             assert "Auto-trade is on" in sent[0][0] and "FILLED" in sent[1][0]
             db2.c.execute("UPDATE estimates SET close_ts=1"); db2.c.commit()
@@ -457,6 +457,30 @@ def test_full_cycle_alert_then_settle():
             assert db2.order_for_estimate(1)["pnl"] > 0 and any("settled YES" in s[0] for s in sent)
     finally:
         telegram.send, estimator.estimate = saved
+
+
+def test_pagination_follows_cursor_and_flags_truncation():
+    def fake(pages):
+        calls = []
+        def _get(path, params=None):
+            i = len(calls)
+            calls.append(params)
+            return {"markets": [raw_market(ticker=f"KXTEST-{i}-{j}") for j in range(3)],
+                    "cursor": f"c{i + 1}" if i + 1 < pages else ""}
+        return _get, calls
+
+    k = kalshi.Kalshi(base_url="http://x")
+    k._get, calls = fake(pages=4)
+    with cfg(MAX_PAGES=10):
+        out = k._pages({"limit": 1000})
+    assert len(out) == 12 and len(calls) == 4 and not k.truncated
+    assert calls[1]["cursor"] == "c1"
+
+    k = kalshi.Kalshi(base_url="http://x")
+    k._get, calls = fake(pages=50)
+    with cfg(MAX_PAGES=3):
+        out = k._pages({"limit": 1000})
+    assert len(out) == 9 and len(calls) == 3 and k.truncated
 
 
 if __name__ == "__main__":

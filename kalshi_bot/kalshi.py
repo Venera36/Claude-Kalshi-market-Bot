@@ -89,6 +89,7 @@ class Kalshi:
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": "Claude-Kalshi-Bot/1.0 (read-only market data)", "Accept": "application/json"})
         self._events = {}
+        self.truncated = False
 
     def _get(self, path, params=None):
         for attempt in range(4):
@@ -131,12 +132,17 @@ class Kalshi:
             cursor = data.get("cursor")
             if not cursor:
                 break
+        else:
+            if cursor:   # hit the page cap with more pages left: the scan is incomplete, and silently so unless we say it
+                self.truncated = True
+                log.warning("market scan truncated at MAX_PAGES=%d (%d markets); more remain. Raise MAX_PAGES "
+                            "or narrow CLOSE_MAX_DAYS / SERIES", C.MAX_PAGES, len(out))
         return out
 
     def candidates(self):
         now = int(time.time())
         lo, hi = now + int(C.CLOSE_MIN_HOURS * 3600), now + int(C.CLOSE_MAX_DAYS * 86400)
-        raws = []
+        raws, self.truncated = [], False
         if C.SERIES:
             for s in (x.strip() for x in C.SERIES.split(",") if x.strip()):
                 raws += self._pages({"series_ticker": s, "status": "open", "limit": 1000})
@@ -147,7 +153,8 @@ class Kalshi:
         out = [m for m in parsed if structural_ok(m, lo, hi)]
         n_ok = len(out)
         out = [m for m in out if not excluded(m)]
-        log.info("scanned %d markets, %d pass the structural filters%s", len(parsed), len(out),
+        log.info("scanned %d markets%s, %d pass the structural filters%s", len(parsed),
+                 " (TRUNCATED)" if self.truncated else "", len(out),
                  f" ({n_ok - len(out)} more excluded by EXCLUDE_SERIES)" if n_ok != len(out) else "")
         return out
 

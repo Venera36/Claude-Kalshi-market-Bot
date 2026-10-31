@@ -27,19 +27,24 @@ def select(db, cands):
     now = time.time()
     ev_counts = {}
     chosen = []
+    skip = {"recent": 0, "event_cap": 0}
     for m in sorted(cands, key=lambda x: (-x["volume24h"], -x["volume"])):
         if len(chosen) >= C.MAX_ESTIMATES_PER_CYCLE:
             break
         last = db.last_estimate(m["ticker"])
         if last and now - last["ts"] < C.REESTIMATE_HOURS * 3600 and abs(m["mid"] - last["mid"]) < C.REESTIMATE_MOVE:
+            skip["recent"] += 1
             continue
         ev = m["event_ticker"]
         if ev not in ev_counts:
             ev_counts[ev] = db.count_event_since(ev, now - 86400)
         if ev_counts[ev] >= C.MAX_PER_EVENT:
+            skip["event_cap"] += 1
             continue
         ev_counts[ev] += 1
         chosen.append(m)
+    log.info("selected %d of %d candidates (MAX_ESTIMATES_PER_CYCLE=%d; passed over: %d estimated recently, %d at event cap)",
+             len(chosen), len(cands), C.MAX_ESTIMATES_PER_CYCLE, skip["recent"], skip["event_cap"])
     return chosen
 
 
@@ -134,7 +139,7 @@ def run_cycle(db, kal, broker, dry):
     cands = kal.candidates()
     for m in select(db, cands):
         if not budget_take(db):
-            log.info("daily estimate budget (%d) reached", C.DAILY_ESTIMATE_BUDGET)
+            log.info("daily estimate budget (DAILY_ESTIMATE_BUDGET=%d) reached", C.DAILY_ESTIMATE_BUDGET)
             break
         handle_market(db, kal, broker, m, dry)
 
