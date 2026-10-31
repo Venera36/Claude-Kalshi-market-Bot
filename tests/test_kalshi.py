@@ -444,12 +444,18 @@ def test_full_cycle_alert_then_settle():
     telegram.send = lambda t, b=None: sent.append((t, b))
     estimator.estimate = lambda q, mk: dict(p=0.80, confidence="high", resolution_risk="low", rationale="because", uncertainties=["u"], in_tok=10, out_tok=5, searches=1)
     try:
+        # The fake model says 80% against a 42% market: a 38-point gap, which the extreme-gap guard must skip.
+        db0 = DB(tempfile.mkdtemp())
+        with trading(TRADING_MODE="off"), cfg(MIN_EDGE=0.05, MODEL_WEIGHT=1.0, MIN_VOLUME=100, CLOSE_MIN_HOURS=0, MAX_MODEL_GAP=0.25):
+            M.run_cycle(db0, kal, None, False)
+            assert sent == []
+        # With the guard off, the same estimate goes through the full alert -> trade -> settle cycle.
         db = DB(tempfile.mkdtemp())
-        with trading(TRADING_MODE="off"), cfg(MIN_EDGE=0.05, MODEL_WEIGHT=1.0, MIN_VOLUME=100, CLOSE_MIN_HOURS=0):
+        with trading(TRADING_MODE="off"), cfg(MIN_EDGE=0.05, MODEL_WEIGHT=1.0, MIN_VOLUME=100, CLOSE_MIN_HOURS=0, MAX_MODEL_GAP=0):
             M.run_cycle(db, kal, None, False)
             assert len(sent) == 1 and "BUY YES" in sent[0][0] and sent[0][1][0][1].startswith("d:a:")
         db2 = DB(tempfile.mkdtemp()); sent.clear()
-        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.08), cfg(MODEL_WEIGHT=1.0, MIN_VOLUME=100):
+        with trading(TRADING_MODE="paper", TRADE_APPROVAL="auto", AUTO_MIN_EDGE=0.08), cfg(MODEL_WEIGHT=1.0, MIN_VOLUME=100, MAX_MODEL_GAP=0):
             M.run_cycle(db2, kal, trader.PaperBroker(db2), False)
             assert "Auto-trade is on" in sent[0][0] and "FILLED" in sent[1][0]
             db2.c.execute("UPDATE estimates SET close_ts=1"); db2.c.commit()
